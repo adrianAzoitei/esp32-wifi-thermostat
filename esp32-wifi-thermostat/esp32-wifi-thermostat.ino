@@ -15,19 +15,21 @@
 #endif
 
 #include <OneWire.h>
-#include <DallasTemperature.h>
 #include <OpenTherm.h>
 #include "RingBuffer.h"
+#include "ATC_MiThermometer.h"
 
-const char* ssid = "WIFI-SSID";
-const char* password = "WIFI-PASSWORD";
+const char* ssid = "changeme";
+const char* password = "changeme";
 
 //Master OpenTherm Shield pins configuration
 const int OT_IN_PIN = 21;  //4 for ESP8266 (D2), 21 for ESP32
 const int OT_OUT_PIN = 22; //5 for ESP8266 (D1), 22 for ESP32
 
-//Temperature sensor pin
-const int ROOM_TEMP_SENSOR_PIN = 18; //14 for ESP8266 (D5), 18 for ESP32
+// known mac address of mi sensor
+std::vector<std::string> miMacAddresses = {};
+ATC_MiThermometer miThermometer(miMacAddresses);
+const int scanTime = 5; // BLE scan time in seconds
 
 OpenTherm ot(OT_IN_PIN, OT_OUT_PIN);
 #ifdef ESP32
@@ -35,8 +37,6 @@ WebServer server(80);
 #elif defined(ESP8266)
 ESP8266WebServer server(80);
 #endif
-OneWire oneWire(ROOM_TEMP_SENSOR_PIN);
-DallasTemperature sensors(&oneWire);
 
 const char HTTP_HEAD_BEGIN[] PROGMEM = "<!DOCTYPE html><html lang=\"en\"><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"/><title>{v}</title>";
 const char HTTP_STYLE[] PROGMEM = "<style>\
@@ -115,12 +115,29 @@ void ICACHE_RAM_ATTR handleInterrupt() {
 }
 
 float getTemperature() {
-    float t = sensors.getTempCByIndex(0);
-    if (t < 0)
-    {
-        t = 0;
+    miThermometer.resetData();
+    
+    // Get sensor data - run BLE scan for <scanTime>
+    unsigned found = miThermometer.getData(scanTime);
+
+    if (miThermometer.data[0].valid) {
+        Serial.printf("Name: %s\n", miThermometer.data[0].name.c_str());
+        Serial.printf("%.2f°C\n", miThermometer.data[0].temperature/100.0);
+        Serial.printf("%.2f%%\n", miThermometer.data[0].humidity/100.0);
+        Serial.printf("%.3fV\n",  miThermometer.data[0].batt_voltage/1000.0);
+        Serial.printf("%d%%\n",   miThermometer.data[0].batt_level);
+        Serial.printf("%ddBm\n",  miThermometer.data[0].rssi);
+        Serial.println();
+    } else {
+        Serial.println("Mi sensor not found during this scan.");
     }
-    return t;
+    Serial.print("Devices found: ");
+    Serial.println(found);
+    Serial.println();
+
+    // Delete results from BLEScan buffer to release memory
+    miThermometer.clearScanResults();
+    return miThermometer.data[0].temperature / 100.0;
 }
 
 float pid(float sp, float pv, float pv_last, float& ierr, float dt) {
@@ -476,13 +493,10 @@ void setup(void) {
     server.begin();
     Serial.println("HTTP server started");
 
-    ot.begin(handleInterrupt, processResponse);
+    // ot.begin(handleInterrupt, processResponse);
     marked_min = millis() / 60000;
 
-    //Init DS18B20 sensor
-    sensors.begin();
-    sensors.requestTemperatures();
-    sensors.setWaitForConversion(false); //switch to async mode
+    miThermometer.begin();
     room_temperature, room_temperature_last = getTemperature();
     ts = millis();
 }
@@ -604,6 +618,5 @@ void loop(void) {
         ts = new_ts;
         ch_setpoint = pid(room_setpoint, room_temperature, room_temperature_last, ierr, dt);
         room_temperature_last = room_temperature;
-        sensors.requestTemperatures(); //async temperature request
     }
 }
