@@ -14,22 +14,24 @@
 #include <ESP8266mDNS.h>
 #endif
 
+#include "secrets.h"
+#include "RingBuffer.h"
 #include <OneWire.h>
 #include <OpenTherm.h>
-#include "RingBuffer.h"
 #include "ATC_MiThermometer.h"
 
-const char* ssid = "changeme";
-const char* password = "changeme";
+const char* ssid = WIFI_SSID;
+const char* password = WIFI_PASSWORD;
 
 //Master OpenTherm Shield pins configuration
 const int OT_IN_PIN = 21;  //4 for ESP8266 (D2), 21 for ESP32
 const int OT_OUT_PIN = 22; //5 for ESP8266 (D1), 22 for ESP32
 
 // known mac address of mi sensor
-std::vector<std::string> miMacAddresses = {};
+std::vector<std::string> miMacAddresses = { MI_MAC_ADDR };
 ATC_MiThermometer miThermometer(miMacAddresses);
-const int scanTime = 5; // BLE scan time in seconds
+const int scanTime = 3; // BLE scan time in seconds
+const int ble_poll_frequency = 15; // run a scan every five seconds
 
 OpenTherm ot(OT_IN_PIN, OT_OUT_PIN);
 #ifdef ESP32
@@ -95,16 +97,25 @@ uint8_t CHEnabled = 0, DHWEnabled = 0, CoolingEnabled = 0;
 uint8_t boiler_status = 0;
 float ch_temperature = 0;
 float ch_setpoint = 0;
-float room_temperature = 0;
-float room_setpoint = 5;
+float room_temperature = 18;
+float room_setpoint = 18;
 float modulation_level = 0;
 unsigned long marked_min = 0;
 
-float room_temperature_last = 0, //prior temperature
-ierr = 0, //integral error
-dt = 0, //time between measurements
-op = 0; //PID controller output
+
+float Kp = 10.0;         // Proportional gain
+float Ki = 0.1;          // Integral gain
+float Kd = 5.0;          // Derivative gain
+
+float prev_error = 0.0;
+float integral = 0.0;
+unsigned long last_time = 0;
+
+const float minWaterTemp = 35.0;  // Minimum allowed boiler temp
+const float maxWaterTemp = 70.0;  // Maximum allowed boiler temp
+
 unsigned long ts = 0, new_ts = 0; //timestamp
+unsigned long ble_ts = 0, new_ble_ts = 0; //timestamp
 
 RingBuffer<ChartItem, 300> chart_items;
 byte req_idx = 0;
@@ -116,55 +127,42 @@ void ICACHE_RAM_ATTR handleInterrupt() {
 
 float getTemperature() {
     miThermometer.resetData();
-    
+  
     // Get sensor data - run BLE scan for <scanTime>
     unsigned found = miThermometer.getData(scanTime);
 
     if (miThermometer.data[0].valid) {
-        Serial.printf("Name: %s\n", miThermometer.data[0].name.c_str());
         Serial.printf("%.2f°C\n", miThermometer.data[0].temperature/100.0);
-        Serial.printf("%.2f%%\n", miThermometer.data[0].humidity/100.0);
-        Serial.printf("%.3fV\n",  miThermometer.data[0].batt_voltage/1000.0);
-        Serial.printf("%d%%\n",   miThermometer.data[0].batt_level);
-        Serial.printf("%ddBm\n",  miThermometer.data[0].rssi);
         Serial.println();
+        // Delete results from BLEScan buffer to release memory
+        miThermometer.clearScanResults();
+        return miThermometer.data[0].temperature / 100.0;
     } else {
         Serial.println("Mi sensor not found during this scan.");
     }
-    Serial.print("Devices found: ");
-    Serial.println(found);
-    Serial.println();
-
-    // Delete results from BLEScan buffer to release memory
-    miThermometer.clearScanResults();
-    return miThermometer.data[0].temperature / 100.0;
+      Serial.println();
+    return room_temperature;
 }
 
-float pid(float sp, float pv, float pv_last, float& ierr, float dt) {
-    float KP = 30;
-    float KI = 0.02;
-    // upper and lower bounds on heater level
-    float ophi = 80;
-    float oplo = 10;
-    // calculate the error
-    float error = sp - pv;
-    // calculate the integral error
-    ierr = ierr + KI * error * dt;
-    // calculate the measurement derivative
-    //float dpv = (pv - pv_last) / dt;
-    // calculate the PID output
-    float P = KP * error; //proportional contribution
-    float I = ierr; //integral contribution
-    float op = P + I;
-    // implement anti-reset windup
-    if ((op < oplo) || (op > ophi)) {
-        I = I - KI * error * dt;
-        // clip output
-        op = max(oplo, min(ophi, op));
-    }
-    ierr = I;
-    Serial.println("sp=" + String(sp) + " pv=" + String(pv) + " dt=" + String(dt) + " op=" + String(op) + " P=" + String(P) + " I=" + String(I));
-    return op;
+float computeBoilerWaterSetpoint(float setpoint, float roomTemp, float dt) {
+
+    float error = setpoint - roomTemp;  // Temperature difference
+    integral += error * dt;  // Accumulate error
+    float derivative = (error - prev_error) / dt;
+    prev_error = error;
+
+    float P = (Kp * error);
+    float I = (Ki * integral);
+    float D = (Kd * derivative);
+
+    float output = P + I + D;
+    
+    // Clamp output to valid water temperature range
+    output = constrain(output, minWaterTemp, maxWaterTemp);
+
+    Serial.println("room setpoint:" + String(setpoint) + " room temperature=" + String(roomTemp) + " dt=" + String(dt) + " boiler setpoint=" + String(output) + " P=" + String(P) + " I=" + String(I) + " D=" + String(D));
+
+    return output;
 }
 
 void handleNotFound() {
@@ -493,11 +491,11 @@ void setup(void) {
     server.begin();
     Serial.println("HTTP server started");
 
-    // ot.begin(handleInterrupt, processResponse);
+    ot.begin(handleInterrupt, processResponse);
     marked_min = millis() / 60000;
 
     miThermometer.begin();
-    room_temperature, room_temperature_last = getTemperature();
+    room_temperature = getTemperature();
     ts = millis();
 }
 
@@ -612,11 +610,14 @@ void loop(void) {
     server.handleClient();
 
     new_ts = millis();
-    if (new_ts - ts > 1000) {
+    new_ble_ts = new_ts;
+    if (new_ble_ts - ble_ts > ble_poll_frequency * 1000) {
         room_temperature = getTemperature();
-        dt = (new_ts - ts) / 1000.0;
+        ble_ts = new_ble_ts;
+      }
+    if (new_ts - ts > 1000) {
+        float dt = (new_ts - ts) / 1000.0;
         ts = new_ts;
-        ch_setpoint = pid(room_setpoint, room_temperature, room_temperature_last, ierr, dt);
-        room_temperature_last = room_temperature;
+        ch_setpoint = computeBoilerWaterSetpoint(room_setpoint, room_temperature, dt);
     }
 }
