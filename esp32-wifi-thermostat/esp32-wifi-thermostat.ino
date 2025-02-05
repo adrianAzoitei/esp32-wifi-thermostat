@@ -2,21 +2,13 @@
  Name:		esp32_wifi_thermostat.ino
  Author:	DIYLESS
 */
-#ifdef ESP32
 #include <WiFi.h>
 #include <WiFiClient.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
-#elif defined(ESP8266)
-#include <ESP8266WiFi.h>
-#include <WiFiClient.h>
-#include <ESP8266WebServer.h>
-#include <ESP8266mDNS.h>
-#endif
 
 #include "secrets.h"
 #include "RingBuffer.h"
-#include <OneWire.h>
 #include <OpenTherm.h>
 #include "ATC_MiThermometer.h"
 
@@ -34,11 +26,7 @@ const int scanTime = 3; // BLE scan time in seconds
 const int ble_poll_frequency = 15; // run a scan every five seconds
 
 OpenTherm ot(OT_IN_PIN, OT_OUT_PIN);
-#ifdef ESP32
 WebServer server(80);
-#elif defined(ESP8266)
-ESP8266WebServer server(80);
-#endif
 
 const char HTTP_HEAD_BEGIN[] PROGMEM = "<!DOCTYPE html><html lang=\"en\"><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"/><title>{v}</title>";
 const char HTTP_STYLE[] PROGMEM = "<style>\
@@ -106,6 +94,10 @@ unsigned long marked_min = 0;
 float Kp = 10.0;         // Proportional gain
 float Ki = 0.1;          // Integral gain
 float Kd = 5.0;          // Derivative gain
+float P = 0.0;
+float I = 0.0;
+float D = 0.0;
+float output = 0.0;
 
 float prev_error = 0.0;
 float integral = 0.0;
@@ -151,14 +143,14 @@ float computeBoilerWaterSetpoint(float setpoint, float roomTemp, float dt) {
     float derivative = (error - prev_error) / dt;
     prev_error = error;
 
-    float P = (Kp * error);
-    float I = (Ki * integral);
-    float D = (Kd * derivative);
+    P = (Kp * error);
+    I = (Ki * integral);
+    D = (Kd * derivative);
 
-    float output = P + I + D;
+    float out = P + I + D;
     
     // Clamp output to valid water temperature range
-    output = constrain(output, minWaterTemp, maxWaterTemp);
+    output = constrain(out, minWaterTemp, maxWaterTemp);
 
     Serial.println("room setpoint:" + String(setpoint) + " room temperature=" + String(roomTemp) + " dt=" + String(dt) + " boiler setpoint=" + String(output) + " P=" + String(P) + " I=" + String(I) + " D=" + String(D));
 
