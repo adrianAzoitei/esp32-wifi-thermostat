@@ -90,13 +90,17 @@ float room_setpoint = 18;
 float modulation_level = 0;
 unsigned long marked_min = 0;
 
+bool hysteresis = true;
+float threshold = 0.2;  // margin
+float restartDelta = 0.5;  // prevents rapid switching
 
-float Kp = 10.0;         // Proportional gain
+float Kp = 30.0;         // Proportional gain
 float Ki = 0.1;          // Integral gain
 float Kd = 5.0;          // Derivative gain
 float P = 0.0;
 float I = 0.0;
 float D = 0.0;
+
 float output = 0.0;
 
 float prev_error = 0.0;
@@ -139,7 +143,12 @@ float getTemperature() {
 float computeBoilerWaterSetpoint(float setpoint, float roomTemp, float dt) {
 
     float error = setpoint - roomTemp;  // Temperature difference
-    integral += error * dt;  // Accumulate error
+    // Anti-windup: Stop integrating if no heating is needed
+    if (error < 0) {
+      integral = 0;
+    } else {
+      integral += error * dt;  // Accumulate error
+    }
     float derivative = (error - prev_error) / dt;
     prev_error = error;
 
@@ -155,6 +164,16 @@ float computeBoilerWaterSetpoint(float setpoint, float roomTemp, float dt) {
     Serial.println("room setpoint:" + String(setpoint) + " room temperature=" + String(roomTemp) + " dt=" + String(dt) + " boiler setpoint=" + String(output) + " P=" + String(P) + " I=" + String(I) + " D=" + String(D));
 
     return output;
+}
+
+void updateBoilerState(float setpoint, float roomTemp) {
+    if (CHEnabled == 1 && roomTemp >= setpoint - threshold) {
+        // Turn off the boiler if the temperature is within the desired range
+        CHEnabled = 0;
+    } else if (CHEnabled == 0 && roomTemp <= setpoint - restartDelta) {
+        // Turn the boiler back on only if temperature drops significantly
+        CHEnabled = 1;
+    }
 }
 
 void handleNotFound() {
@@ -255,6 +274,36 @@ void handleStatus() {
     Serial.println(">>> Status request: " + String(status, BIN));
     updateStatus(status);
     server.send(200, "text/html", String("ok"));
+}
+
+void handleHysteresis() {
+    hysteresis = !hysteresis;
+    server.send(200, "text/html", String("ok"));
+}
+
+void handleMetrics() {
+    String response = "";
+    response += "boiler_setpoint " + String(ch_setpoint) + "\n";
+    response += "boiler_temperature " + String(ch_temperature) + "\n";
+    response += "modulation_level " + String(modulation_level) + "\n";
+    response += "room_setpoint " + String(room_setpoint) + "\n";
+    response += "room_temperature " + String(room_temperature) + "\n";
+    response += "boiler_status " + String(boiler_status) + "\n";
+    response += "ch_enabled " + String(CHEnabled) + "\n";
+    response += "pid_p " + String(P) + "\n";
+    response += "pid_i " + String(I) + "\n";
+    response += "pid_d " + String(D) + "\n";
+    response += "pid_output " + String(output) + "\n";
+
+    server.send(200, "text/plain", response);
+}
+
+void resetErrors() {
+  P = 0.0;
+  I = 0.0;
+  integral = 0.0;
+  D = 0.0;
+  server.send(200, "text/html", String("ok"));
 }
 
 void updateCHTempRequest(float t) {
@@ -472,6 +521,9 @@ void setup(void) {
     server.on("/chart.svg", handleChart);
     server.on("/msg", handleMessage);
     server.on("/status", handleStatus);
+    server.on("/metrics", handleMetrics);
+    server.on("/reset", resetErrors);
+    server.on("/hysteresis", handleHysteresis);
     server.on("/ch_temp", handleCHTemp);
     server.on("/room_setpoint", handleRoomSetpoint);
     server.on("/test", []() {
@@ -611,5 +663,6 @@ void loop(void) {
         float dt = (new_ts - ts) / 1000.0;
         ts = new_ts;
         ch_setpoint = computeBoilerWaterSetpoint(room_setpoint, room_temperature, dt);
+        if (hysteresis) updateBoilerState(room_setpoint, room_temperature);
     }
 }
