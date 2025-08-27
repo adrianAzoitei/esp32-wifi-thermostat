@@ -6,6 +6,7 @@
 #include <WiFiClient.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
+#include "time.h"
 
 #include "secrets.h"
 #include "RingBuffer.h"
@@ -14,6 +15,9 @@
 
 const char* ssid = WIFI_SSID;
 const char* password = WIFI_PASSWORD;
+
+IPAddress metricsServer(192,168,178,209);
+WiFiClient client;
 
 //Master OpenTherm Shield pins configuration
 const int OT_IN_PIN = 21;  //4 for ESP8266 (D2), 21 for ESP32
@@ -58,7 +62,7 @@ const char HTTP_HEAD_END[] PROGMEM = "</head><body onload=\"attachEvents(1)\"><d
 const char HTTP_END[] PROGMEM = "</div></body></html>";
 const char HTTP_INFO[] PROGMEM = "<table width=\"100%\">\
 <tr><th>Central Heating</th><td><label class=\"s\"><input type=\"checkbox\" id=\"0\" {s} /><div class=\"sl\"></div></label></td></tr>\
-<tr><th>Domestic Hot Water</th><td><label class=\"s\"><input type=\"checkbox\" id=\"1\" {d} /><div class=\"sl\"></div></label></td></tr>\
+<tr><th>Direct bluetooth sensor</th><td><label class=\"s\"><input type=\"checkbox\" id=\"1\" {d} /><div class=\"sl\"></div></label></td></tr>\
 <tr><th>Cooling</th><td><label class=\"s\"><input type=\"checkbox\" id=\"2\" {c} /><div class=\"sl\"></div></label></td></tr>\
 <tr><th>Fault</th><td><label class=\"s\"><input class=\"e\" type=\"checkbox\" disabled {0} /><div class=\"sl\"></div></label></td></tr>\
 <tr><th>Diagnostic</th><td><label class=\"s\"><input class=\"e\" type=\"checkbox\" disabled {6} /><div class=\"sl\"></div></label></td></tr>\
@@ -77,10 +81,10 @@ OpenThermMessageID requests[] = {
 const byte requests_count = sizeof(requests) / sizeof(uint8_t);
 
 #define MASTER_STATUS_CH_ENABLED 0x1
-#define MASTER_STATUS_DHW_ENABLED 0x2
+#define DIRECT_BLUETOOTH_ENABLED 0x2
 #define MASTER_STATUS_COOLING_ENABLED 0x4
 
-uint8_t CHEnabled = 0, DHWEnabled = 0, CoolingEnabled = 0;
+uint8_t CHEnabled = 0, DirectBluetoothEnabled = 0, CoolingEnabled = 0;
 
 uint8_t boiler_status = 0;
 float ch_temperature = 0;
@@ -107,7 +111,7 @@ float prev_error = 0.0;
 float integral = 0.0;
 unsigned long last_time = 0;
 
-const float minWaterTemp = 35.0;  // Minimum allowed boiler temp
+const float minWaterTemp = 15.0;  // Minimum allowed boiler temp
 const float maxWaterTemp = 70.0;  // Maximum allowed boiler temp
 
 unsigned long ts = 0, new_ts = 0; //timestamp
@@ -117,27 +121,47 @@ RingBuffer<ChartItem, 300> chart_items;
 byte req_idx = 0;
 ChartItem* curr_item = NULL;
 
+// NTP server to request epoch time
+const char* ntpServer = "pool.ntp.org";
+// Variable to save current epoch time
+unsigned long epochTime; 
+// Function that gets current epoch time
+unsigned long getTime() {
+  time_t now;
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    //Serial.println("Failed to obtain time");
+    return(0);
+  }
+  time(&now);
+  return now;
+}
+
 void ICACHE_RAM_ATTR handleInterrupt() {
     ot.handleInterrupt();
 }
 
 float getTemperature() {
+  if (DirectBluetoothEnabled == 1) {
     miThermometer.resetData();
   
     // Get sensor data - run BLE scan for <scanTime>
     unsigned found = miThermometer.getData(scanTime);
 
     if (miThermometer.data[0].valid) {
-        Serial.printf("%.2f°C\n", miThermometer.data[0].temperature/100.0);
-        Serial.println();
-        // Delete results from BLEScan buffer to release memory
-        miThermometer.clearScanResults();
-        return miThermometer.data[0].temperature / 100.0;
-    } else {
-        Serial.println("Mi sensor not found during this scan.");
-    }
+      Serial.printf("%.2f°C\n", miThermometer.data[0].temperature/100.0);
       Serial.println();
-    return room_temperature;
+      // Delete results from BLEScan buffer to release memory
+      miThermometer.clearScanResults();
+      return miThermometer.data[0].temperature / 100.0;
+    } else {
+      Serial.println("Mi sensor not found during this scan.");
+    }
+    Serial.println();
+  } else {
+    Serial.println("Using external API temperature source.");
+  }
+  return room_temperature;
 }
 
 float computeBoilerWaterSetpoint(float setpoint, float roomTemp, float dt) {
@@ -165,6 +189,7 @@ float computeBoilerWaterSetpoint(float setpoint, float roomTemp, float dt) {
 
     return output;
 }
+
 
 void updateBoilerState(float setpoint, float roomTemp) {
     if (CHEnabled == 1 && roomTemp >= setpoint - threshold) {
@@ -207,7 +232,7 @@ String getInfo() {
     String page = FPSTR(HTTP_INFO);
     page.replace("{0}", bitRead(boiler_status, 0) ? "checked=\"checked\"" : "");
     page.replace("{s}", CHEnabled ? "checked=\"checked\"" : "");
-    page.replace("{d}", DHWEnabled ? "checked=\"checked\"" : "");
+    page.replace("{d}", DirectBluetoothEnabled ? "checked=\"checked\"" : "");
     page.replace("{c}", CoolingEnabled ? "checked=\"checked\"" : "");
     page.replace("{6}", bitRead(boiler_status, 6) ? "checked=\"checked\"" : "");
 
@@ -265,7 +290,7 @@ void handleMessage() {
 
 void updateStatus(byte status) {
     CHEnabled = (status & MASTER_STATUS_CH_ENABLED) ? 1 : 0;
-    DHWEnabled = (status & MASTER_STATUS_DHW_ENABLED) ? 1 : 0;
+    DirectBluetoothEnabled = (status & DIRECT_BLUETOOTH_ENABLED) ? 1 : 0;
     CoolingEnabled = (status & MASTER_STATUS_COOLING_ENABLED) ? 1 : 0;
 }
 
@@ -363,11 +388,26 @@ void updateRoomSetpointRequest(float t) {
     room_setpoint = t;
 }
 
+void updateRoomTemperature(float t) {
+    room_temperature = t;
+}
+
 void handleRoomSetpoint() {
     float t = server.arg("value").toFloat();
     Serial.println(">>> Room Setpoint request: " + String(t));
     updateRoomSetpointRequest(t);
     server.send(200, "text/html", String("ok"));
+}
+
+void handleRoomTemperature() {
+  if (DirectBluetoothEnabled == 1) {
+    Serial.println("WARNING: Please disable direct Bluetooth sensing before using this feature!");
+  } else {
+    float t = server.arg("value").toFloat();
+    Serial.println(">>> Room temperature updated: " + String(t));
+    updateRoomTemperature(t);
+    server.send(200, "text/html", String("ok"));
+  }
 }
 
 uint16_t getTChartValue(uint8_t t)
@@ -506,6 +546,8 @@ void setup(void) {
         delay(500);
         Serial.print(".");
     }
+    configTime(0, 0, ntpServer);
+
     Serial.println("");
     Serial.print("Connected to ");
     Serial.println(ssid);
@@ -526,6 +568,7 @@ void setup(void) {
     server.on("/hysteresis", handleHysteresis);
     server.on("/ch_temp", handleCHTemp);
     server.on("/room_setpoint", handleRoomSetpoint);
+    server.on("/room_temperature", handleRoomTemperature);
     server.on("/test", []() {
         server.send(200, "text/plain", "this works as well");
         });
@@ -599,8 +642,6 @@ unsigned int buildRequest(byte req_idx)
     case OpenThermMessageID::Status:
         status = 0;
         if (CHEnabled) status |= MASTER_STATUS_CH_ENABLED;
-        if (DHWEnabled) status |= MASTER_STATUS_DHW_ENABLED;
-        if (CoolingEnabled) status |= MASTER_STATUS_COOLING_ENABLED;
         status <<= 8;
         return ot.buildRequest(OpenThermMessageType::READ, OpenThermMessageID::Status, status);
     case OpenThermMessageID::TSet:
@@ -650,6 +691,7 @@ void handleOpenTherm() {
 }
 
 void loop(void) {
+    epochTime = getTime();
     handleOpenTherm();
     server.handleClient();
 
